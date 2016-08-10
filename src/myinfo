@@ -1,0 +1,581 @@
+http://www.it165.net/design/html/201406/2651.html
+http://blog.csdn.net/gf771115/article/details/45643271/
+
+问题1:怎么上传
+栗子中最后返回的是Blob数据
+return new Blob([dataview], { type: type })
+
+因为对html5不熟,所以又查了一些数据
+
+原来HTML5中使用FormData这个对象好方便
+
+var fd = new FormData();
+fd.append('audioData', blob);
+var xhr = new XMLHttpRequest();
+xhr.open('POST', url);
+xhr.send(fd);
+
+在C#服务器端 如下代码就可以接收了
+
+public void ProcessRequest(HttpContext context)
+{
+if (context.Request.Files.Count > 0)
+{
+context.Request.Files[0].SaveAs('d:\1.wav');
+}
+}
+问题2:文件体积太大
+是的,使用上面的栗子,直接录音保存后基本上2秒就需要400K,一段20秒的录音就达到了的4M，这样的数据根本无法使用,必须想办法压缩数据
+我开始尝试读每一段代码
+function encodeWAV(samples){
+  var buffer = new ArrayBuffer(44 + samples.length * 2);
+  var view = new DataView(buffer);
+ 
+  /* RIFF identifier */
+  writeString(view, 0, 'RIFF');
+  /* file length */
+  view.setUint32(4, 32 + samples.length * 2, true);
+  /* RIFF type */
+  writeString(view, 8, 'WAVE');
+  /* format chunk identifier */
+  writeString(view, 12, 'fmt ');
+  /* format chunk length */
+  view.setUint32(16, 16, true);
+  /* sample format (raw) */
+  view.setUint16(20, 1, true);
+  /* channel count */
+  view.setUint16(22, 2, true);
+  /* sample rate */
+  view.setUint32(24, sampleRate, true);
+  /* byte rate (sample rate * block align) */
+  view.setUint32(28, sampleRate * 4, true);
+  /* block align (channel count * bytes per sample) */
+  view.setUint16(32, 4, true);
+  /* bits per sample */
+  view.setUint16(34, 16, true);
+  /* data chunk identifier */
+  writeString(view, 36, 'data');
+  /* data chunk length */
+  view.setUint32(40, samples.length * 2, true);
+ 
+  floatTo16BitPCM(view, 44, samples);
+ 
+  return view;
+}
+
+上面的代码,就是把字节数据格式化成wav的格式的过程
+
+所以我又去查了wav的头文件
+要压缩,就要从上面三个红圈的地方入手：通道数，采样频率，采样位数。
+
+最简单的就是把双声道改成单声道的,
+
+在录音的时候只需要记录一个声道就可以了
+    // 创建声音的缓存节点，createJavaScriptNode方法的
+    // 第二个和第三个参数指的是输入和输出都是双声道。
+    //recorder = context.createJavaScriptNode(bufferSize, 2, 2);
+    recorder = context.createJavaScriptNode(bufferSize, 1, 1);//这里改成1
+
+    this.node.onaudioprocess = function(e){
+      if (!recording) return;
+      worker.postMessage({
+        command: 'record',
+        buffer: [
+          e.inputBuffer.getChannelData(0)//,
+          //e.inputBuffer.getChannelData(1)// 这里只需要保存一个
+        ]
+      });
+    }
+
+function exportWAV(type){
+  var bufferL = mergeBuffers(recBuffersL, recLength);
+  //var bufferR = mergeBuffers(recBuffersR, recLength);
+  var interleaved = interleave(bufferL);//, bufferR); //合并数据的时候去到对右声道的处理
+  var dataview = encodeWAV(interleaved);
+  var audioBlob = new Blob([dataview], { type: type });
+ 
+  this.postMessage(audioBlob);
+}
+
+function interleave(inputL){//, inputR){//混合声道的时候去掉对右声道的处理
+  var length = inputL.length ;//+ inputR.length;
+  var result = new Float32Array(length);
+ 
+  var index = 0,
+    inputIndex = 0;
+ 
+  while (index < length){
+    result[index++] = inputL[inputIndex];
+    //result[index++] = inputR[inputIndex];
+    inputIndex++;
+  }
+  return result;
+}
+
+然后修改一下注释,我不喜欢英文的....
+function encodeWAV(samples) {
+    var dataLength = samples.length * 2;
+    var buffer = new ArrayBuffer(44 + dataLength);
+    var view = new DataView(buffer);
+
+    var sampleRateTmp = sampleRate;
+    var sampleBits = 16;
+    var channelCount = 1;
+    var offset = 0;
+    /* 资源交换文件标识符 */
+    writeString(view, offset, 'RIFF'); offset += 4;
+    /* 下个地址开始到文件尾总字节数,即文件大小-8 */
+    view.setUint32(offset, /*32这里地方栗子中的值错了,但是不知道为什么依然可以运行成功*/ 36 + dataLength, true); offset += 4;
+    /* WAV文件标志 */
+    writeString(view, offset, 'WAVE'); offset += 4;
+    /* 波形格式标志 */
+    writeString(view, offset, 'fmt '); offset += 4;
+    /* 过滤字节,一般为 0x10 = 16 */
+    view.setUint32(offset, 16, true); offset += 4;
+    /* 格式类别 (PCM形式采样数据) */
+    view.setUint16(offset, 1, true); offset += 2;
+    /* 通道数 */
+    view.setUint16(offset, channelCount, true); offset += 2;
+    /* 采样率,每秒样本数,表示每个通道的播放速度 */
+    view.setUint32(offset, sampleRateTmp, true); offset += 4;
+    /* 波形数据传输率 (每秒平均字节数) 通道数×每秒数据位数×每样本数据位/8 */
+    view.setUint32(offset, sampleRateTmp * channelCount * (sampleBits / 8), true); offset += 4;
+    /* 快数据调整数 采样一次占用字节数 通道数×每样本的数据位数/8 */
+    view.setUint16(offset, channelCount * (sampleBits / 8), true); offset += 2;
+    /* 每样本数据位数 */
+    view.setUint16(offset, sampleBits, true); offset += 2;
+    /* 数据标识符 */
+    writeString(view, offset, 'data'); offset += 4;
+    /* 采样数据总数,即数据总大小-44 */
+    view.setUint32(offset, dataLength, true); offset += 4;
+    /* 采样数据 */
+    floatTo16BitPCM(view, 44, samples);
+
+    return view;
+}
+
+一旦把双声道变为单声道,数据直接缩小一半了
+
+但是还不够
+
+继续缩小体积
+除了声道以外,还有一个可以缩减的地方就是采样位数 默认是16位的,我们改成8位 又可以减少一半了
+
+function encodeWAV(samples) {
+    var sampleBits = 8;//16;//这里改成8位
+    var dataLength = samples.length * (sampleBits / 8);
+    var buffer = new ArrayBuffer(44 + dataLength);
+    var view = new DataView(buffer);
+
+    var sampleRateTmp = sampleRate;
+
+    var channelCount = 1;
+    var offset = 0;
+    /* 资源交换文件标识符 */
+    writeString(view, offset, 'RIFF'); offset += 4;
+    /* 下个地址开始到文件尾总字节数,即文件大小-8 */
+    view.setUint32(offset, /*32这里地方栗子中的值错了,但是不知道为什么依然可以运行成功*/ 36 + dataLength, true); offset += 4;
+    /* WAV文件标志 */
+    writeString(view, offset, 'WAVE'); offset += 4;
+    /* 波形格式标志 */
+    writeString(view, offset, 'fmt '); offset += 4;
+    /* 过滤字节,一般为 0x10 = 16 */
+    view.setUint32(offset, 16, true); offset += 4;
+    /* 格式类别 (PCM形式采样数据) */
+    view.setUint16(offset, 1, true); offset += 2;
+    /* 通道数 */
+    view.setUint16(offset, channelCount, true); offset += 2;
+    /* 采样率,每秒样本数,表示每个通道的播放速度 */
+    view.setUint32(offset, sampleRateTmp, true); offset += 4;
+    /* 波形数据传输率 (每秒平均字节数) 通道数×每秒数据位数×每样本数据位/8 */
+    view.setUint32(offset, sampleRateTmp * channelCount * (sampleBits / 8), true); offset += 4;
+    /* 快数据调整数 采样一次占用字节数 通道数×每样本的数据位数/8 */
+    view.setUint16(offset, channelCount * (sampleBits / 8), true); offset += 2;
+    /* 每样本数据位数 */
+    view.setUint16(offset, sampleBits, true); offset += 2;
+    /* 数据标识符 */
+    writeString(view, offset, 'data'); offset += 4;
+    /* 采样数据总数,即数据总大小-44 */
+    view.setUint32(offset, dataLength, true); offset += 4;
+    /* 采样数据 */
+    //floatTo16BitPCM(view, 44, samples);
+    floatTo8BitPCM(view, 44, samples);//这里改为写入8位的数据
+    return view;
+}
+8和16的取值范围不一样
+
+\
+
+对比一下To8和To16的方法
+
+这里方法是我自己猜的,如果不对还望指出~~~
+function floatTo16BitPCM(output, offset, input) {
+    for (var i = 0; i < input.length; i++, offset += 2) {   //因为是int16所以占2个字节,所以偏移量是+2
+        var s = Math.max(-1, Math.min(1, input[i]));
+        output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+}
+
+
+function floatTo8BitPCM(output, offset, input) {
+    for (var i = 0; i < input.length; i++, offset++) {    //这里只能加1了
+        var s = Math.max(-1, Math.min(1, input[i]));
+        var val = s < 0 ? s * 0x8000 : s * 0x7FFF;         
+        val = parseInt(255 / (65535 / (val + 32768)));     //这里有一个转换的代码,这个是我个人猜测的,就是按比例转换
+        output.setInt8(offset, val, true);
+    }
+}
+
+怀着忐忑的心情,启动网页...居然听的到声音~居然成功了!!!
+
+经过这样之后又减少了一半大小
+
+最后就是这个采样率了
+网页中录音组件的采样率是44100 不知道在哪里改,查询了一些资料,未果...
+
+所以又自己猜测了,是不是我把已经缓存的时候按照比例抛弃一些就可以模拟减少采样率的操作呢?
+
+比如现在已经缓存的数据大小是40960 是不是我直接间隔一位抛弃一次数据,将数据大小变成20480 就可以算是采样率变成22050了呢?
+
+同理,要编程11025只要再抛弃一半的数据?
+
+所以我又做了如下修改
+function interleave(inputL, inputR) {
+    var compression = 44100 / 11025;    //计算压缩率 
+    var length = inputL.length / compression;
+    var result = new Float32Array(length);
+
+    var index = 0,
+      inputIndex = 0;
+
+    while (index < length) {
+        result[index] = inputL[inputIndex];
+        inputIndex += compression;//每次都跳过3个数据
+        index++;
+    }
+    return result;
+}
+
+
+function encodeWAV(samples) {
+    var dataLength = samples.length;
+    var buffer = new ArrayBuffer(44 + dataLength);
+    var view = new DataView(buffer);
+
+    var sampleRateTmp = 11025 ;//sampleRate;//写入新的采样率 
+    var sampleBits = 8;
+    var channelCount = 1;
+    var offset = 0;
+    /* 资源交换文件标识符 */
+    writeString(view, offset, 'RIFF'); offset += 4;
+    /* 下个地址开始到文件尾总字节数,即文件大小-8 */
+    view.setUint32(offset, /*32*/ 36 + dataLength, true); offset += 4;
+    /* WAV文件标志 */
+    writeString(view, offset, 'WAVE'); offset += 4;
+    /* 波形格式标志 */
+    writeString(view, offset, 'fmt '); offset += 4;
+    /* 过滤字节,一般为 0x10 = 16 */
+    view.setUint32(offset, 16, true); offset += 4;
+    /* 格式类别 (PCM形式采样数据) */
+    view.setUint16(offset, 1, true); offset += 2;
+    /* 通道数 */
+    view.setUint16(offset, channelCount, true); offset += 2;
+    /* 采样率,每秒样本数,表示每个通道的播放速度 */
+    view.setUint32(offset, sampleRateTmp, true); offset += 4;
+    /* 波形数据传输率 (每秒平均字节数) 通道数×每秒数据位数×每样本数据位/8 */
+    view.setUint32(offset, sampleRateTmp * channelCount * (sampleBits / 8), true); offset += 4;
+    /* 快数据调整数 采样一次占用字节数 通道数×每样本的数据位数/8 */
+    view.setUint16(offset, channelCount * (sampleBits / 8), true); offset += 2;
+    /* 每样本数据位数 */
+    view.setUint16(offset, sampleBits, true); offset += 2;
+    /* 数据标识符 */
+    writeString(view, offset, 'data'); offset += 4;
+    /* 采样数据总数,即数据总大小-44 */
+    view.setUint32(offset, dataLength, true); offset += 4;
+    /* 采样数据 */
+    floatTo16BitPCM(view, 44, samples);
+
+    return view;
+}
+
+再次怀着忐忑的心情,启动网页...居然听的到声音~居然又成功了
+
+最后把之前的代码整理封装一下
+
+(function (window) {
+    //兼容
+    window.URL = window.URL || window.webkitURL;
+    navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia || navigator.msGetUserMedia;
+
+    var HZRecorder = function (stream, config) {
+        config = config || {};
+        config.sampleBits = config.sampleBits || 8;      //采样数位 8, 16
+        config.sampleRate = config.sampleRate || (44100 / 6);   //采样率(1/6 44100)
+
+        var context = new webkitAudioContext();
+        var audioInput = context.createMediaStreamSource(stream);
+        var recorder = context.createJavaScriptNode(4096, 1, 1);
+
+        var audioData = {
+            size: 0          //录音文件长度
+            , buffer: []     //录音缓存
+            , inputSampleRate: context.sampleRate    //输入采样率
+            , inputSampleBits: 16       //输入采样数位 8, 16
+            , outputSampleRate: config.sampleRate    //输出采样率
+            , oututSampleBits: config.sampleBits       //输出采样数位 8, 16
+            , input: function (data) {
+                this.buffer.push(new Float32Array(data));
+                this.size += data.length;
+            }
+            , compress: function () { //合并压缩
+                //合并
+                var data = new Float32Array(this.size);
+                var offset = 0;
+                for (var i = 0; i < this.buffer.length; i++) {
+                    data.set(this.buffer[i], offset);
+                    offset += this.buffer[i].length;
+                }
+                //压缩
+                var compression = parseInt(this.inputSampleRate / this.outputSampleRate);
+                var length = data.length / compression;
+                var result = new Float32Array(length);
+                var index = 0, j = 0;
+                while (index < length) {
+                    result[index] = data[j];
+                    j += compression;
+                    index++;
+                }
+                return result;
+            }
+            , encodeWAV: function () {
+                var sampleRate = Math.min(this.inputSampleRate, this.outputSampleRate);
+                var sampleBits = Math.min(this.inputSampleBits, this.oututSampleBits);
+                var bytes = this.compress();
+                var dataLength = bytes.length * (sampleBits / 8);
+                var buffer = new ArrayBuffer(44 + dataLength);
+                var data = new DataView(buffer);
+
+                var channelCount = 1;//单声道
+                var offset = 0;
+
+                var writeString = function (str) {
+                    for (var i = 0; i < str.length; i++) {
+                        data.setUint8(offset + i, str.charCodeAt(i));
+                    }
+                }
+                
+                // 资源交换文件标识符 
+                writeString('RIFF'); offset += 4;
+                // 下个地址开始到文件尾总字节数,即文件大小-8 
+                data.setUint32(offset, 36 + dataLength, true); offset += 4;
+                // WAV文件标志
+                writeString('WAVE'); offset += 4;
+                // 波形格式标志 
+                writeString('fmt '); offset += 4;
+                // 过滤字节,一般为 0x10 = 16 
+                data.setUint32(offset, 16, true); offset += 4;
+                // 格式类别 (PCM形式采样数据) 
+                data.setUint16(offset, 1, true); offset += 2;
+                // 通道数 
+                data.setUint16(offset, channelCount, true); offset += 2;
+                // 采样率,每秒样本数,表示每个通道的播放速度 
+                data.setUint32(offset, sampleRate, true); offset += 4;
+                // 波形数据传输率 (每秒平均字节数) 单声道×每秒数据位数×每样本数据位/8 
+                data.setUint32(offset, channelCount * sampleRate * (sampleBits / 8), true); offset += 4;
+                // 快数据调整数 采样一次占用字节数 单声道×每样本的数据位数/8 
+                data.setUint16(offset, channelCount * (sampleBits / 8), true); offset += 2;
+                // 每样本数据位数 
+                data.setUint16(offset, sampleBits, true); offset += 2;
+                // 数据标识符 
+                writeString('data'); offset += 4;
+                // 采样数据总数,即数据总大小-44 
+                data.setUint32(offset, dataLength, true); offset += 4;
+                // 写入采样数据 
+                if (sampleBits === 8) {
+                    for (var i = 0; i < bytes.length; i++, offset++) {
+                        var s = Math.max(-1, Math.min(1, bytes[i]));
+                        var val = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        val = parseInt(255 / (65535 / (val + 32768)));
+                        data.setInt8(offset, val, true);
+                    }
+                } else {
+                    for (var i = 0; i < bytes.length; i++, offset += 2) {
+                        var s = Math.max(-1, Math.min(1, bytes[i]));
+                        data.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                    }
+                }
+
+                return new Blob([data], { type: 'audio/wav' });
+            }
+        };
+
+        //开始录音
+        this.start = function () {
+            audioInput.connect(recorder);
+            recorder.connect(context.destination);
+        }
+
+        //停止
+        this.stop = function () {
+            recorder.disconnect();
+        }
+
+        //获取音频文件
+        this.getBlob = function () {
+            this.stop();
+            return audioData.encodeWAV();
+        }
+
+        //回放
+        this.play = function (audio) {
+            audio.src = window.URL.createObjectURL(this.getBlob());
+        }
+
+        //上传
+        this.upload = function (url, callback) {
+            var fd = new FormData();
+            fd.append('audioData', this.getBlob());
+            var xhr = new XMLHttpRequest();
+            if (callback) {
+                xhr.upload.addEventListener('progress', function (e) {
+                    callback('uploading', e);
+                }, false);
+                xhr.addEventListener('load', function (e) {
+                    callback('ok', e);
+                }, false);
+                xhr.addEventListener('error', function (e) {
+                    callback('error', e);
+                }, false);
+                xhr.addEventListener('abort', function (e) {
+                    callback('cancel', e);
+                }, false);
+            }
+            xhr.open('POST', url);
+            xhr.send(fd);
+        }
+
+        //音频采集
+        recorder.onaudioprocess = function (e) {
+            audioData.input(e.inputBuffer.getChannelData(0));
+            //record(e.inputBuffer.getChannelData(0));
+        }
+
+    };
+    //抛出异常
+    HZRecorder.throwError = function (message) {
+        alert(message);
+        throw new function () { this.toString = function () { return message; } }
+    }
+    //是否支持录音
+    HZRecorder.canRecording = (navigator.getUserMedia != null);
+    //获取录音机
+    HZRecorder.get = function (callback, config) {
+        if (callback) {
+            if (navigator.getUserMedia) {
+                navigator.getUserMedia(
+                    { audio: true } //只启用音频
+                    , function (stream) {
+                        var rec = new HZRecorder(stream, config);
+                        callback(rec);
+                    }
+                    , function (error) {
+                        switch (error.code || error.name) {
+                            case 'PERMISSION_DENIED':
+                            case 'PermissionDeniedError':
+                                HZRecorder.throwError('用户拒绝提供信息。');
+                                break;
+                            case 'NOT_SUPPORTED_ERROR':
+                            case 'NotSupportedError':
+                                HZRecorder.throwError('<a href="http://www.it165.net/edu/ewl/" target="_blank" class="keylink">浏览器</a>不支持硬件设备。');
+                                break;
+                            case 'MANDATORY_UNSATISFIED_ERROR':
+                            case 'MandatoryUnsatisfiedError':
+                                HZRecorder.throwError('无法发现指定的硬件设备。');
+                                break;
+                            default:
+                                HZRecorder.throwError('无法打开麦克风。异常信息:' + (error.code || error.name));
+                                break;
+                        }
+                    });
+            } else {
+                HZRecorder.throwErr('当前<a href="http://www.it165.net/edu/ewl/" target="_blank" class="keylink">浏览器</a>不支持录音功能。'); return;
+            }
+        }
+    }
+
+    window.HZRecorder = HZRecorder;
+
+})(window);
+
+html
+<!DOCTYPE html>
+<html xmlns='http://www.w3.org/1999/xhtml'>
+<head>
+    <meta http-equiv='Content-Type' content='text/html; charset=utf-8' />
+    <title></title>
+</head>
+<body>
+    <div>
+        <audio controls autoplay></audio>
+        <input onclick='startRecording()' type='button' value='录音' />
+        <input onclick='stopRecording()' type='button' value='停止' />
+        <input onclick='playRecording()' type='button' value='播放' />
+        <input onclick='uploadAudio()' type='button' value='提交' />
+    </div>
+
+    <script type='text/javascript' src='HZRecorder.js'></script>
+
+
+    <script>
+
+        var recorder;
+
+        var audio = document.querySelector('audio');
+
+        function startRecording() {
+            HZRecorder.get(function (rec) {
+                recorder = rec;
+                recorder.start();
+            });
+        }
+
+        function stopRecording() {
+            recorder.stop();
+        }
+
+        function playRecording() {
+            recorder.play(audio);
+        }
+
+        function uploadAudio() {
+            recorder.upload('Handler1.ashx', function (state, e) {
+                switch (state) {
+                    case 'uploading':
+                        //var percentComplete = Math.round(e.loaded * 100 / e.total) + '%';
+                        break;
+                    case 'ok':
+                        //alert(e.target.responseText);
+                        alert('上传成功');
+                        break;
+                    case 'error':
+                        alert('上传失败');
+                        break;
+                    case 'cancel':
+                        alert('上传被取消');
+                        break;
+                }
+            });
+        }
+
+    </script>
+
+</body>
+</html>
+
+好了 下班了
+源码下载: http://www.it165.net/uploadfile/files/2014/0611/RecordingDemo.rar
+
+demo默认采用 44100/6 的采样率 ,原来20秒要4M ,单声道砍一半 2M ,8位砍一半 1M, 6分之一采样率 1M/6 170K左右
+
+微信4秒只有4K是怎么做到的? 
+
